@@ -30,6 +30,17 @@
         <p id="status-msg" class="text-xs text-gray-400">ยังไม่มีการเชื่อมต่อ</p>
         <p id="viewer-count" class="text-xs text-green-400 mt-2 hidden">ผู้รับชม: 0 คน</p>
         <div id="toast" class="mt-3 hidden fixed bottom-6 left-1/2 transform -translate-x-1/2 bg-gray-800 text-white px-4 py-2 rounded shadow-lg text-sm z-50"></div>
+
+        <div id="diag-panel" class="mt-4 text-left text-xs bg-gray-900 p-3 rounded-md border border-gray-700">
+            <div class="flex justify-between items-center mb-2">
+                <strong class="text-sm text-cyan-300">Diagnostics</strong>
+                <div class="flex gap-2">
+                    <button id="copy-diag" class="px-2 py-1 text-xs bg-gray-800 rounded">Copy logs</button>
+                    <button id="show-ice" class="px-2 py-1 text-xs bg-gray-800 rounded">Show ICE</button>
+                </div>
+            </div>
+            <pre id="diag-log" class="whitespace-pre-wrap max-h-40 overflow-auto text-[12px] text-gray-300"></pre>
+        </div>
     </div>
 
     <!-- Preview Video -->
@@ -77,12 +88,14 @@
                 myIdEl.classList.remove('text-gray-500');
                 myIdEl.classList.add('text-yellow-400');
                 showToast('Ready. ส่ง ID ให้ผู้ชมเพื่อเชื่อมต่อ');
+                logDiag('Peer open: ' + id);
             });
 
             // รอ Viewer เชื่อมต่อเข้ามา (Handshake)
             peer.on('connection', (conn) => {
                 conn.on('open', () => {
                     console.log("New viewer connected:", conn.peer);
+                    logDiag('New viewer connected: ' + conn.peer);
                     
                     // เก็บ conn เพื่อจัดการปิดการเชื่อมต่อได้
                     viewersMap[conn.peer] = conn;
@@ -106,6 +119,7 @@
 
                 conn.on('close', () => {
                     console.log('Viewer connection closed', conn.peer);
+                    logDiag('Viewer connection closed: ' + conn.peer, 'warn');
                     delete viewersMap[conn.peer];
                     viewers = viewers.filter(id => id !== conn.peer);
                     updateViewerCount();
@@ -140,12 +154,14 @@
             
             call.on('close', () => {
                 console.log("Viewer disconnected");
+                logDiag('Call closed for: ' + viewerId);
                 viewers = viewers.filter(id => id !== viewerId);
                 updateViewerCount();
             });
 
             call.on('error', (err) => {
                 console.error('Call error to', viewerId, err);
+                logDiag('Call error to ' + viewerId + ': ' + err, 'error');
                 showToast('Error sending stream to ' + viewerId,'error');
             });
         }
@@ -167,6 +183,25 @@
             clearTimeout(toast._hideTimeout);
             toast._hideTimeout = setTimeout(() => toast.classList.add('hidden'), timeout);
         }
+
+        // Diagnostics logging
+        function logDiag(message, level = 'info') {
+            const el = document.getElementById('diag-log');
+            if (!el) return;
+            const t = new Date().toLocaleTimeString();
+            el.textContent = `[${t}] ${message}\n` + el.textContent;
+        }
+
+        document.getElementById('copy-diag').addEventListener('click', () => {
+            const el = document.getElementById('diag-log');
+            if (!el) return;
+            navigator.clipboard.writeText(el.textContent || '').then(() => showToast('คัดลอก log แล้ว'));
+        });
+
+        document.getElementById('show-ice').addEventListener('click', () => {
+            logDiag('ICE servers: ' + JSON.stringify(ICE_SERVERS));
+            showToast('แสดง ICE servers ใน diagnostics');
+        });
 
         // 2. ปุ่มเริ่มแชร์หน้าจอ
         btnShare.addEventListener('click', async () => {
@@ -190,9 +225,11 @@
 
                 // โทรหาทุกคนที่รออยู่ใน List
                 viewers.forEach(id => callViewer(id));
+                logDiag('Started sharing. Called ' + viewers.length + ' viewers.');
 
                 // ดักจับเมื่อกด Stop Sharing ที่ Browser
                 localStream.getVideoTracks()[0].onended = () => {
+                    logDiag('Screen sharing stopped by user');
                     showToast('การแชร์หน้าจอสิ้นสุดลง','info', 2000);
                     setTimeout(() => location.reload(), 1600);
                 };
