@@ -88,6 +88,14 @@
               }
             });
             dbg('SourceBuffer created with mime ' + mime);
+
+            // --- แก้ไข: เริ่มเล่นข้อมูลที่ค้างท่อทันที (Kickstart) ---
+            if (appendQueue.length > 0 && !sourceBuffer.updating) {
+               const buf = appendQueue.shift();
+               try { sourceBuffer.appendBuffer(buf); } catch(e) { dbg('Kickstart append error: ' + e); }
+            }
+            // ----------------------------------------------------
+
           } catch (e) { dbg('SourceBuffer creation failed for mime ' + mime + ': ' + e); }
         });
       }
