@@ -41,6 +41,9 @@
         <button onclick="location.reload()" class="text-red-400 hover:text-red-300 transition">Disconnect</button>
     </div>
 
+    <button id="play-btn" class="hidden fixed bottom-20 left-1/2 transform -translate-x-1/2 bg-cyan-500 text-white px-4 py-2 rounded">Play</button>
+    <div id="toast" class="hidden fixed bottom-6 left-1/2 transform -translate-x-1/2 bg-gray-800 text-white px-4 py-2 rounded shadow-lg text-sm z-50"></div>
+
     <script>
         const loginScreen = document.getElementById('login-screen');
         const remoteIdInput = document.getElementById('remote-id-input');
@@ -52,15 +55,22 @@
         let peer = null;
 
         // Init PeerJS
+        // ICE servers - add TURN server here if your users are behind strict NATs/firewalls
+        const ICE_SERVERS = [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:stun2.l.google.com:19302' },
+            // { urls: 'turn:your.turn.server:3478', username: 'user', credential: 'pass' }
+        ];
+
         peer = new Peer(null, {
             debug: 1,
-            config: {
-                iceServers: [
-                    { urls: 'stun:stun.l.google.com:19302' },
-                    { urls: 'stun:stun1.l.google.com:19302' },
-                    { urls: 'stun:stun2.l.google.com:19302' }
-                ]
-            }
+            config: { iceServers: ICE_SERVERS }
+        });
+
+        peer.on('error', (err) => {
+            console.error('Peer error:', err);
+            showToast('Peer error: ' + err, 'error');
         });
 
         // 1. รอรับสายจาก Host (จุดสำคัญ: รับภาพตรงนี้)
@@ -80,12 +90,16 @@
                 controlsOverlay.style.display = 'flex';
                 
                 remoteVideo.srcObject = remoteStream;
-                remoteVideo.play().catch(e => console.error("Autoplay blocked:", e));
+                remoteVideo.play().catch(e => {
+                    console.error("Autoplay blocked:", e);
+                    showToast('Autoplay blocked — กดปุ่ม Play เพื่อเริ่มเล่น', 'warn', 6000);
+                    document.getElementById('play-btn').classList.remove('hidden');
+                });
             });
 
             call.on('close', () => {
-                alert("Host หยุดแชร์หน้าจอแล้ว");
-                location.reload();
+                showToast('Host หยุดแชร์หน้าจอแล้ว','info',2000);
+                setTimeout(() => location.reload(), 1500);
             });
         });
 
@@ -107,13 +121,21 @@
             conn.on('open', () => {
                 statusLog.innerText = "เชื่อมต่อสำเร็จ! รอ Host ส่งภาพ...";
                 statusLog.className = "text-xs text-green-400 mt-4 h-4";
+                showToast('เชื่อมต่อกับ Host เรียบร้อย','info');
             });
 
             conn.on('data', (data) => {
                 if(data.msg) {
                     // แสดงข้อความจาก Host (เช่น "รอสักครู่...")
                     statusLog.innerText = data.msg;
+                    showToast(data.msg,'info',3000);
                 }
+            });
+
+            conn.on('close', () => {
+                showToast('การเชื่อมต่อกับ Host ถูกตัด','warn');
+                btnConnect.disabled = false;
+                btnConnect.classList.remove('opacity-50');
             });
             
             conn.on('error', (err) => {
@@ -122,7 +144,15 @@
                 statusLog.className = "text-xs text-red-400 mt-4 h-4";
                 btnConnect.disabled = false;
                 btnConnect.classList.remove('opacity-50');
+                showToast('เชื่อมต่อไม่ได้ (ID ผิดหรือ Host ปิดอยู่)','error');
             });
+        });
+
+        // Play button (autoplay fallback)
+        document.getElementById('play-btn').addEventListener('click', () => {
+            remoteVideo.play().then(() => {
+                document.getElementById('play-btn').classList.add('hidden');
+            }).catch(e => console.error('Play failed:', e));
         });
 
         function toggleFullScreen() {
@@ -131,6 +161,19 @@
             } else {
                 if (document.exitFullscreen) document.exitFullscreen();
             }
+        }
+
+        // Simple toast utility
+        function showToast(message, type = 'info', timeout = 3500) {
+            const toast = document.getElementById('toast');
+            if (!toast) return;
+            toast.className = 'fixed bottom-6 left-1/2 transform -translate-x-1/2 px-4 py-2 rounded shadow-lg text-sm z-50';
+            const bg = type === 'error' ? 'bg-red-600' : type === 'warn' ? 'bg-yellow-600' : 'bg-gray-800';
+            toast.classList.add(bg);
+            toast.innerText = message;
+            toast.classList.remove('hidden');
+            clearTimeout(toast._hideTimeout);
+            toast._hideTimeout = setTimeout(() => toast.classList.add('hidden'), timeout);
         }
     </script>
 </body>
