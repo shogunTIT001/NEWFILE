@@ -1,0 +1,221 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Viewer - Screen Share</title>
+  <style>
+    /* Prevent unexpected animation and provide rotation controls */
+    video { transform-origin: center center; transform: rotate(0deg); transition: transform 150ms ease; object-fit: contain; max-width:100%; height:auto; animation:none !important; }
+    #rotateControls { margin-top:8px; display:none; }
+    #rotateControls button { margin-right:6px; }
+    #rotateNotice { font-size:12px; color:#333; margin-left:8px; }
+  </style>
+</head>
+<body>
+  <h1>Viewer / Watch</h1>
+  <div>
+    <input id="codeInput" placeholder="Enter code" />
+    <button id="joinBtn">Join</button>
+  </div>
+  <div>Accessible at: <span id="addresses">loading...</span></div>
+  <div id="rotateControls" style="display:none;">
+    <button id="rot0">0°</button>
+    <button id="rot90">90°</button>
+    <button id="rot180">180°</button>
+    <button id="rot270">270°</button>
+    <button id="autoFix">Auto-Fix</button>
+    <span id="rotateNotice"></span>
+  </div>
+  <video id="remote" autoplay playsinline controls style="width:80%;border:1px solid #ccc"></video>
+  <div id="debug" style="font-family:monospace;font-size:12px;white-space:pre-wrap;max-height:160px;overflow:auto;border:1px solid #ddd;padding:6px;margin-top:8px;"></div>
+  <div id="viewerConnStatus" style="margin-top:8px;display:none;">Connection status: <span id="viewerConnMsg"></span> <button id="viewerRetryBtn" style="display:none;">Retry Join</button></div>
+
+  <script>
+    const ws = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws');
+    const joinBtn = document.getElementById('joinBtn');
+    const codeInput = document.getElementById('codeInput');
+    const remote = document.getElementById('remote');
+
+    // Debug helper: logs to console and to on-page debug box
+    function dbg(msg) {
+      console.log(msg);
+      const d = document.getElementById('debug'); if (d) d.textContent += msg + '\n';
+    }
+
+    ws.addEventListener('open', () => dbg('WS open'));
+    ws.addEventListener('close', () => dbg('WS close'));
+    ws.addEventListener('error', (e) => dbg('WS error: ' + e));
+    ws.addEventListener('message', (ev) => dbg('WS raw msg: ' + ev.data));
+
+    const params = new URLSearchParams(location.search);
+    const autoCode = params.get('code') ? params.get('code').trim().toUpperCase() : null;
+    if (autoCode) codeInput.value = autoCode;
+    let autoJoin = !!autoCode;
+
+    ws.addEventListener('open', () => { dbg('WS open (socket ready)'); if (autoJoin) { dbg('auto-joining code ' + autoCode); joinBtn.click(); } });
+
+    let pc = null;
+    let pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+    async function updateIceServers() {
+      try {
+        const res = await fetch('/info');
+        const data = await res.json();
+        if (data && data.iceServers) pcConfig = { iceServers: data.iceServers };
+        dbg('pcConfig iceServers: ' + JSON.stringify(pcConfig.iceServers));
+      } catch (e) { dbg('updateIceServers failed: ' + e); }
+    }
+    updateIceServers();
+
+    // For buffered mode we need to handle string (JSON) messages and binary segment messages separately.
+    const pendingSegmentMetas = [];
+    let mediaSource = null;
+    let sourceBuffer = null;
+    const appendQueue = [];
+
+    function ensureMediaSource(mime) {
+      if (!mediaSource) {
+        mediaSource = new MediaSource();
+        remote.src = URL.createObjectURL(mediaSource);
+        mediaSource.addEventListener('sourceopen', () => {
+          try {
+            sourceBuffer = mediaSource.addSourceBuffer(mime);
+            sourceBuffer.mode = 'sequence';
+            sourceBuffer.addEventListener('updateend', () => {
+              if (appendQueue.length) {
+                const buf = appendQueue.shift();
+                try { sourceBuffer.appendBuffer(buf); } catch (e) { dbg('append error: ' + e); }
+              }
+            });
+            dbg('SourceBuffer created with mime ' + mime);
+          } catch (e) { dbg('SourceBuffer creation failed for mime ' + mime + ': ' + e); }
+        });
+      }
+    }
+
+    ws.addEventListener('message', async (ev) => {
+      if (typeof ev.data === 'string') {
+        dbg('WS raw msg: ' + ev.data);
+        const msg = JSON.parse(ev.data);
+        if (msg.action === 'joined') {
+          dbg('joined room ' + msg.code);
+        }
+
+        if (msg.action === 'buffered-mode' && msg.mode === 'buffered') {
+          dbg('server indicates room is buffered');
+          // show buffered UI
+          const el = document.getElementById('viewerConnStatus'); const m = document.getElementById('viewerConnMsg'); if (el && m) { el.style.display = 'block'; m.textContent = 'buffered'; }
+        }
+
+        if (msg.action === 'segment') {
+          // metadata for incoming binary segment
+          dbg('incoming segment meta seq=' + msg.seq + ' mime=' + msg.mime + ' size=' + msg.size);
+          pendingSegmentMetas.push(msg);
+          return;
+        }
+
+        if (msg.action === 'signal') {
+          const { from, payload } = msg;
+          if (payload.type === 'offer') {
+            dbg('received offer from ' + from);
+            // create pc with dynamic iceServers
+            pc = new RTCPeerConnection(pcConfig);
+            pc.ontrack = (e) => { dbg('ontrack, streams=' + e.streams.length); remote.srcObject = e.streams[0]; remote.muted = true; remote.play().then(()=>dbg('play OK')).catch(e=>dbg('play error: '+e)); };
+            pc.onicecandidate = (e) => {
+              if (e.candidate) { dbg('local candidate: ' + JSON.stringify(e.candidate)); ws.send(JSON.stringify({ action: 'signal', to: 'host', payload: { candidate: e.candidate } })); }
+            };
+            pc.oniceconnectionstatechange = () => {
+              dbg('iceConnectionState: ' + pc.iceConnectionState);
+              const el = document.getElementById('viewerConnStatus'); const m = document.getElementById('viewerConnMsg'); const retry = document.getElementById('viewerRetryBtn');
+              if (el && m) { el.style.display = 'block'; m.textContent = pc.iceConnectionState; }
+              if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') { if (retry) retry.style.display = 'inline-block'; }
+            };
+            pc.onconnectionstatechange = () => {
+              dbg('connectionState: ' + pc.connectionState);
+              const el = document.getElementById('viewerConnStatus'); const m = document.getElementById('viewerConnMsg'); const retry = document.getElementById('viewerRetryBtn');
+              if (el && m) { el.style.display = 'block'; m.textContent = pc.connectionState; }
+              if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') { if (retry) retry.style.display = 'inline-block'; }
+            };
+
+            await pc.setRemoteDescription(new RTCSessionDescription(payload));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            dbg('sending answer');
+            ws.send(JSON.stringify({ action: 'signal', to: 'host', payload: answer }));
+
+          } else if (payload.candidate) {
+            dbg('remote candidate: ' + JSON.stringify(payload.candidate));
+            if (pc) pc.addIceCandidate(new RTCIceCandidate(payload.candidate)).catch(e => dbg('addIceCandidate error: ' + e));
+          }
+        }
+
+        if (msg.action === 'host-left') {
+          alert('Host left');
+          if (pc) pc.close(); pc = null; remote.srcObject = null;
+          const rc = document.getElementById('rotateControls'); if (rc) rc.style.display = 'none';
+          try { setRotation(0); } catch (e) { }
+        }
+
+        if (msg.action === 'error') alert(msg.message);
+      } else {
+        // binary frame: segment data
+        dbg('WS binary message received, size=' + ev.data.byteLength);
+        const buf = await ev.data.arrayBuffer ? await ev.data.arrayBuffer() : ev.data;
+        const meta = pendingSegmentMetas.shift();
+        if (!meta) { dbg('Warning: received segment binary without meta'); return; }
+        // ensure media source and sourceBuffer exist
+        ensureMediaSource(meta.mime);
+        const ab = new Uint8Array(buf);
+        // append or queue
+        if (sourceBuffer && !sourceBuffer.updating && appendQueue.length === 0) {
+          try { sourceBuffer.appendBuffer(ab); dbg('Appended segment seq=' + meta.seq); } catch (e) { dbg('append error immediate: ' + e); appendQueue.push(ab); }
+        } else {
+          appendQueue.push(ab); dbg('Queued segment seq=' + meta.seq);
+        }
+      }
+    });
+
+    async function showInfo() {
+      try {
+        const res = await fetch('/info');
+        const data = await res.json();
+        const el = document.getElementById('addresses');
+        if (!el) return;
+        el.innerHTML = data.addresses.map(a => `<a href="${a}/viewer.html" target="_blank">${a}/viewer.html</a>`).join(' ');
+      } catch (e) { console.warn('info fetch failed', e); }
+    }
+    showInfo();
+
+    // Rotation controls and auto-fix for rotated video displays
+    function setRotation(deg) {
+      remote.style.transform = `rotate(${deg}deg)`;
+      const notice = document.getElementById('rotateNotice'); if (notice) notice.textContent = `Rotation: ${deg}°`;
+    }
+
+    remote.addEventListener('loadedmetadata', () => {
+      const rc = document.getElementById('rotateControls'); if (rc) rc.style.display = 'block';
+      try {
+        if (remote.videoWidth && remote.videoHeight) {
+          if (remote.videoWidth < remote.videoHeight) setRotation(90); else setRotation(0);
+        }
+      } catch (e) { console.warn('rotation detect failed', e); }
+    });
+
+    document.getElementById('rot0').onclick = () => setRotation(0);
+    document.getElementById('rot90').onclick = () => setRotation(90);
+    document.getElementById('rot180').onclick = () => setRotation(180);
+    document.getElementById('rot270').onclick = () => setRotation(270);
+    document.getElementById('autoFix').onclick = () => {
+      if (remote.videoWidth && remote.videoHeight) setRotation(remote.videoWidth < remote.videoHeight ? 90 : 0);
+    };
+
+    joinBtn.onclick = () => {
+      const code = codeInput.value.trim().toUpperCase();
+      if (!code) return alert('Enter code');
+      dbg('join click: ' + code);
+      autoJoin = false; // if user clicked, don't auto click again
+      ws.send(JSON.stringify({ action: 'join', role: 'viewer', code }));
+    };
+  </script> 
+</body>
+</html>

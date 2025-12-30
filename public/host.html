@@ -1,0 +1,249 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Host - Screen Share</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+</head> 
+<body>
+  <h1>Host / Share Screen</h1>
+  <div>
+    <button id="createBtn">Create Room & Get Code</button>
+    <div>Code: <span id="code">-</span></div>
+  </div>
+  <div>
+    <button id="startBtn" disabled>Start Sharing</button>
+    <button id="startBufferedBtn" disabled>Start Buffered Broadcast</button>
+    <button id="stopBufferedBtn" style="display:none;">Stop Buffered Broadcast</button>
+  </div>
+  <div id="viewers">Viewers: <span id="viewerList"></span></div>
+  <div>Pending viewers: <span id="pendingList"></span></div>
+  <div>Accessible at: <span id="addresses">loading...</span></div>
+  <div id="hostDebug" style="font-family:monospace;font-size:12px;white-space:pre-wrap;max-height:160px;overflow:auto;border:1px solid #ddd;padding:6px;margin-top:8px;"></div>
+  <div id="hostConnStatus" style="margin-top:8px;display:none;">Connection status: <span id="hostConnMsg"></span> <button id="hostRetryBtn" style="display:none;">Retry</button></div>
+  <div style="margin-top:8px">QR (scan to open viewer with code): <div id="qrcodes" style="margin-top:6px"></div></div> 
+
+  <script>
+    const ws = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws');
+    const createBtn = document.getElementById('createBtn');
+    const startBtn = document.getElementById('startBtn');
+    const codeEl = document.getElementById('code');
+    const viewerList = document.getElementById('viewerList');
+
+    let roomCode = null;
+    let localStream = null;
+    const pcs = new Map(); // viewerId -> RTCPeerConnection
+    const pendingViewers = new Set();
+
+    // pcConfig will be populated from server /info (so TURN can be provided)
+    let pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+    async function updateIceServers() {
+      try {
+        const res = await fetch('/info');
+        const data = await res.json();
+        if (data && data.iceServers) pcConfig = { iceServers: data.iceServers };
+        dbg('pcConfig iceServers: ' + JSON.stringify(pcConfig.iceServers));
+      } catch (e) { dbg('updateIceServers failed: ' + e); }
+    }
+    updateIceServers();
+
+    function dbg(msg) {
+      console.log(msg);
+      const d = document.getElementById('hostDebug'); if (d) d.textContent += msg + '\n';
+    }
+
+    function updatePendingUI() {
+      const el = document.getElementById('pendingList');
+      if (!el) return; el.textContent = Array.from(pendingViewers).join(' ');
+    }
+
+    ws.addEventListener('message', (ev) => {
+      const msg = JSON.parse(ev.data);
+      dbg('WS msg: ' + ev.data);
+      if (msg.action === 'created') {
+        roomCode = msg.code;
+        codeEl.textContent = roomCode;
+        startBtn.disabled = false;
+        // generate QR codes for viewer URLs
+        generateQRCodes(roomCode);
+      }
+      if (msg.action === 'viewer-joined') {
+        const vid = msg.viewerId;
+        viewerList.textContent += vid + ' ';
+        if (localStream) {
+          dbg('viewer joined, creating PC for ' + vid);
+          createPCForViewer(vid).then(() => dbg('offer sent to ' + vid)).catch(e => dbg('offer error: ' + e));
+        } else {
+          dbg('viewer joined but localStream not ready, queued: ' + vid);
+          pendingViewers.add(vid);
+          updatePendingUI();
+        }
+      }
+
+      if (msg.action === 'signal') {
+        const { from, payload } = msg;
+        const pc = pcs.get(from);
+        if (!pc) return;
+        if (payload.type === 'answer') {
+          dbg('received answer from ' + from);
+          pc.setRemoteDescription(new RTCSessionDescription(payload)).catch(e => dbg('setRemoteDescription error: ' + e));
+        } else if (payload.candidate) {
+          dbg('received candidate from ' + from + ': ' + JSON.stringify(payload.candidate));
+          pc.addIceCandidate(new RTCIceCandidate(payload.candidate)).catch(e => dbg('addIceCandidate error: ' + e));
+        }
+      }
+
+      if (msg.action === 'viewer-left') {
+        const vid = msg.viewerId;
+        viewerList.textContent = viewerList.textContent.replace(vid + ' ', '');
+        pendingViewers.delete(vid); updatePendingUI();
+        const pc = pcs.get(vid);
+        if (pc) { pc.close(); pcs.delete(vid); dbg('closed pc for ' + vid); }
+      }
+
+    });
+
+    createBtn.onclick = () => {
+      ws.send(JSON.stringify({ action: 'create', role: 'host' }));
+    };
+
+    startBtn.onclick = async () => {
+      try {
+        localStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        startBtn.disabled = true;
+        dbg('localStream obtained, tracks: ' + localStream.getTracks().length);
+        // Create PCs for any pending viewers
+        for (const vid of Array.from(pendingViewers)) {
+          pendingViewers.delete(vid); updatePendingUI();
+          dbg('creating pc for pending viewer ' + vid);
+          createPCForViewer(vid).then(() => dbg('offer sent to pending ' + vid)).catch(e => dbg('offer error for pending ' + vid + ': ' + e));
+        }
+      } catch (e) { alert('getDisplayMedia failed: ' + e); }
+    };
+
+    // Buffered broadcast: MediaRecorder -> POST segments to /segment/:room
+    let recorder = null;
+    let segSeq = 0;
+    const SEG_MS = parseInt(window.SEGMENT_MS || '1000', 10);
+
+    document.getElementById('startBufferedBtn').onclick = async () => {
+      if (!roomCode) return alert('Create room first');
+      // tell server this room is buffered
+      ws.send(JSON.stringify({ action: 'set-mode', role: 'host', payload: { mode: 'buffered' } }));
+      try {
+        localStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      } catch (e) { return alert('getDisplayMedia failed: ' + e); }
+      // start MediaRecorder
+      const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus') ? 'video/webm;codecs=vp8,opus' : 'video/webm';
+      recorder = new MediaRecorder(localStream, { mimeType: mime });
+      isBufferedMode = true; // generate QR with buffered mode
+      generateQRCodes(roomCode);
+      recorder.ondataavailable = async (ev) => {
+        if (!ev.data || ev.data.size === 0) return;
+        const blob = ev.data;
+        const seq = (++segSeq).toString();
+        const ts = Date.now().toString();
+        try {
+          await fetch('/segment/' + roomCode, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'x-seq': seq, 'x-ts': ts, 'x-mime': mime }, body: blob });
+          dbg('sent segment seq=' + seq + ' size=' + blob.size);
+        } catch (e) { dbg('segment send failed: ' + e); }
+      };
+      recorder.start(SEG_MS);
+      document.getElementById('startBufferedBtn').style.display = 'none';
+      document.getElementById('stopBufferedBtn').style.display = 'inline-block';
+      dbg('Buffered broadcast started, mime=' + mime + ' segment_ms=' + SEG_MS);
+    };
+
+    document.getElementById('stopBufferedBtn').onclick = () => {
+      if (recorder && recorder.state !== 'inactive') recorder.stop();
+      recorder = null;
+      isBufferedMode = false; generateQRCodes(roomCode);
+      document.getElementById('startBufferedBtn').style.display = 'inline-block';
+      document.getElementById('stopBufferedBtn').style.display = 'none';
+      ws.send(JSON.stringify({ action: 'set-mode', role: 'host', payload: { mode: 'webrtc' } }));
+      dbg('Buffered broadcast stopped');
+    };
+
+    async function createPCForViewer(vid) {
+      if (!localStream) { throw new Error('localStream not available'); }
+      dbg('createPCForViewer: ' + vid);
+      const pc = new RTCPeerConnection(pcConfig);
+      pcs.set(vid, pc);
+
+      // add tracks
+      for (const t of localStream.getTracks()) { pc.addTrack(t, localStream); dbg('added track: ' + t.kind + ' -> pc for ' + vid); }
+
+      pc.onicecandidate = (e) => {
+        if (e.candidate) {
+          dbg('sending candidate to ' + vid + ': ' + JSON.stringify(e.candidate));
+          ws.send(JSON.stringify({ action: 'signal', to: vid, payload: { candidate: e.candidate } }));
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        const s = pc.iceConnectionState; dbg('pc ' + vid + ' iceConnectionState: ' + s);
+        const el = document.getElementById('hostConnStatus'); const m = document.getElementById('hostConnMsg'); const retry = document.getElementById('hostRetryBtn');
+        if (el && m) { el.style.display = 'block'; m.textContent = s; }
+        if (s === 'failed' || s === 'disconnected') { if (retry) retry.style.display = 'inline-block'; }
+      };
+      pc.onconnectionstatechange = () => {
+        const s = pc.connectionState; dbg('pc ' + vid + ' connectionState: ' + s);
+        const el = document.getElementById('hostConnStatus'); const m = document.getElementById('hostConnMsg'); const retry = document.getElementById('hostRetryBtn');
+        if (el && m) { el.style.display = 'block'; m.textContent = s; }
+        if (s === 'failed' || s === 'disconnected') { if (retry) retry.style.display = 'inline-block'; }
+      };
+
+      // create offer
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      dbg('created offer for ' + vid + ', sending');
+      ws.send(JSON.stringify({ action: 'signal', to: vid, payload: offer }));
+    }
+
+    let isBufferedMode = false;
+    function clearQRCodes() {
+      const c = document.getElementById('qrcodes'); if (c) c.innerHTML = '';
+    }
+
+    async function generateQRCodes(room) {
+      clearQRCodes();
+      try {
+        const res = await fetch('/info');
+        const data = await res.json();
+        const c = document.getElementById('qrcodes');
+        if (!c) return;
+        const addrs = (data && data.addresses && data.addresses.length) ? data.addresses : [location.origin];
+        addrs.forEach(a => {
+          const url = a + '/viewer.html?code=' + encodeURIComponent(room) + (isBufferedMode ? '&mode=buffered' : '');
+          const wrap = document.createElement('div'); wrap.style.display = 'inline-block'; wrap.style.margin = '8px';
+          const title = document.createElement('div'); title.textContent = url; title.style.fontSize = '12px'; title.style.maxWidth = '220px'; title.style.wordBreak = 'break-all';
+          const qrDiv = document.createElement('div'); wrap.appendChild(title); wrap.appendChild(qrDiv); c.appendChild(wrap);
+          try { new QRCode(qrDiv, { text: url, width: 140, height: 140 }); } catch (e) { console.warn('QRCode error', e); }
+        });
+      } catch (e) { console.warn('generateQRCodes failed', e); }
+    }
+
+    async function showInfo() {
+      try {
+        const res = await fetch('/info');
+        const data = await res.json();
+        const el = document.getElementById('addresses');
+        if (!el) return;
+        el.innerHTML = data.addresses.map(a => `<a href="${a}/host.html" target="_blank">${a}/host.html</a>`).join(' ');
+      } catch (e) { console.warn('info fetch failed', e); }
+    }
+    showInfo();
+
+    // Retry logic for host: re-create PC for a selected pending viewer (simple UI: retry last)
+    document.getElementById('hostRetryBtn').onclick = () => {
+      const last = Array.from(pcs.keys()).slice(-1)[0];
+      if (last) {
+        try { const pc = pcs.get(last); if (pc) { pc.close(); pcs.delete(last); dbg('closed pc for retry ' + last); } } catch (e) {}
+        // re-create offer
+        createPCForViewer(last).then(() => dbg('retry offer sent to ' + last)).catch(e => dbg('retry error: ' + e));
+      }
+    };
+  </script>
+</body>
+</html>
